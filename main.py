@@ -144,6 +144,10 @@ st.markdown("### Upload Audio File")
 st.info("🎵 Supported formats: MP3, WAV (Will be converted to 16kHz WAV for processing)")
 audio_file = st.file_uploader("Choose an audio file", type=['mp3', 'wav'])
 
+# Play audio button to verify the uploaded file
+if audio_file is not None:
+    st.audio(audio_file, format='audio/wav')
+
 # Parameters
 with st.container():
     col1, col2, col3 = st.columns(3)
