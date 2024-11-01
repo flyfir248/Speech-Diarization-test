@@ -38,7 +38,6 @@ def process_audio(audio_file, num_speakers, language, model_size):
     try:
         # Create a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Save uploaded file
             input_path = os.path.join(temp_dir, "input_audio")
             with open(input_path, "wb") as f:
                 f.write(audio_file.getbuffer())
@@ -59,41 +58,32 @@ def process_audio(audio_file, num_speakers, language, model_size):
 
             model = whisper.load_model(model_size)
             result = model.transcribe(wav_path)
-            segments = result["segments"]
 
-            # Get audio duration
+            # Process transcription segments for diarization
+            segments = result["segments"]
+            embedding_model = load_speaker_embedding_model()
+            embeddings = np.zeros(shape=(len(segments), 192))
+
+            # Get audio duration for clipping
             with contextlib.closing(wave.open(wav_path, 'r')) as f:
                 frames = f.getnframes()
                 rate = f.getframerate()
                 duration = frames / float(rate)
 
-            # Get speaker embeddings
-            embedding_model = load_speaker_embedding_model()
-
-            def segment_embedding(segment):
+            # Embed each segment and collect embeddings
+            for i, segment in enumerate(segments):
                 start = segment["start"]
                 end = min(duration, segment["end"])
-
-                # Load audio segment
                 waveform, sample_rate = torchaudio.load(
                     wav_path,
                     frame_offset=int(start * rate),
                     num_frames=int((end - start) * rate)
                 )
-
-                # Get embedding
                 with torch.no_grad():
                     embedding = embedding_model.encode_batch(waveform)
-                    return embedding.squeeze().cpu().numpy()
-
-            # Get embeddings for each segment
-            embeddings = np.zeros(shape=(len(segments), 192))
-            for i, segment in enumerate(segments):
-                embeddings[i] = segment_embedding(segment)
+                    embeddings[i] = embedding.squeeze().cpu().numpy()
 
             embeddings = np.nan_to_num(embeddings)
-
-            # Cluster embeddings
             clustering = AgglomerativeClustering(num_speakers).fit(embeddings)
             labels = clustering.labels_
 
@@ -117,20 +107,6 @@ st.set_page_config(
 )
 
 st.title("🎙️ Speaker Diarization and Transcription")
-
-# Add CSS
-st.markdown("""
-    <style>
-    .stButton>button {
-        width: 100%;
-    }
-    .status-box {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
 # Check for ffmpeg
 try:
@@ -195,33 +171,3 @@ if audio_file is not None:
 
             except Exception as e:
                 st.error(f"❌ Unexpected error: {str(e)}")
-
-# Help section
-with st.expander("ℹ️ Help & Tips"):
-    st.markdown("""
-    ### Prerequisites:
-    - FFmpeg must be installed on your system
-    - Sufficient disk space for temporary files
-
-    ### Tips for best results:
-    1. **Audio Quality**: Better quality audio will yield more accurate results
-    2. **Model Selection**:
-        - Use larger models for more accuracy (but slower processing)
-        - Use smaller models for faster results
-    3. **Language Selection**:
-        - Choose 'English' if your audio is in English
-        - Choose 'any' for other languages
-    4. **Number of Speakers**:
-        - Set this to the exact number of speakers in your audio
-        - Incorrect speaker counts may lead to less accurate diarization
-
-    ### Troubleshooting:
-    - If processing fails, try with a smaller model size
-    - Ensure your audio file isn't corrupted
-    - Check that FFmpeg is properly installed
-    - Make sure you have enough free disk space
-    """)
-
-# Footer
-st.markdown("---")
-st.markdown("Built with Streamlit, Whisper, and SpeechBrain")
