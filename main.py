@@ -12,6 +12,8 @@ import warnings
 import torchaudio
 from speechbrain.inference.speaker import EncoderClassifier
 import tempfile
+import librosa
+import soundfile as sf
 
 # Filter warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,27 +27,38 @@ def load_speaker_embedding_model():
     )
 
 def convert_audio_to_wav(input_path, output_path):
-    """Convert audio file to WAV format using ffmpeg"""
+    """Convert audio file to mono WAV format using ffmpeg"""
     try:
-        subprocess.run(['ffmpeg', '-i', input_path, '-acodec', 'pcm_s16le', '-ar', '16000', output_path, '-y'],
+        # Convert to 16kHz mono audio
+        subprocess.run(['ffmpeg', '-i', input_path, '-ac', '1', '-ar', '16000', output_path, '-y'],
                        capture_output=True, check=True)
         return True
     except subprocess.CalledProcessError as e:
         st.error(f"Error converting audio: {str(e)}")
         return False
 
+def reduce_noise(wav_path):
+    """Apply noise reduction to the WAV file"""
+    y, sr = librosa.load(wav_path, sr=16000)
+    y_denoised = librosa.effects.preemphasis(y)
+    sf.write(wav_path, y_denoised, sr)
+
 def process_audio(audio_file, num_speakers, language, model_size):
     try:
         # Create a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
+            # Save uploaded file
             input_path = os.path.join(temp_dir, "input_audio")
             with open(input_path, "wb") as f:
                 f.write(audio_file.getbuffer())
 
-            # Convert to WAV
+            # Convert to WAV and reduce noise
             wav_path = os.path.join(temp_dir, "audio.wav")
             if not convert_audio_to_wav(input_path, wav_path):
                 return None, "Failed to convert audio file to WAV format"
+
+            # Noise reduction
+            reduce_noise(wav_path)
 
             # Verify the WAV file exists
             if not os.path.exists(wav_path):
@@ -58,32 +71,57 @@ def process_audio(audio_file, num_speakers, language, model_size):
 
             model = whisper.load_model(model_size)
             result = model.transcribe(wav_path)
-
-            # Process transcription segments for diarization
             segments = result["segments"]
-            embedding_model = load_speaker_embedding_model()
-            embeddings = np.zeros(shape=(len(segments), 192))
 
-            # Get audio duration for clipping
+            # Get audio duration
             with contextlib.closing(wave.open(wav_path, 'r')) as f:
                 frames = f.getnframes()
                 rate = f.getframerate()
                 duration = frames / float(rate)
 
-            # Embed each segment and collect embeddings
-            for i, segment in enumerate(segments):
+            # Get speaker embeddings
+            embedding_model = load_speaker_embedding_model()
+
+            def segment_embedding(segment, wav_path, rate, duration):
                 start = segment["start"]
                 end = min(duration, segment["end"])
-                waveform, sample_rate = torchaudio.load(
-                    wav_path,
-                    frame_offset=int(start * rate),
-                    num_frames=int((end - start) * rate)
-                )
-                with torch.no_grad():
-                    embedding = embedding_model.encode_batch(waveform)
-                    embeddings[i] = embedding.squeeze().cpu().numpy()
+
+                try:
+                    # Use librosa instead of torchaudio for more consistent audio loading
+                    waveform, sample_rate = librosa.load(
+                        wav_path,
+                        offset=start,
+                        duration=end - start,
+                        sr=16000
+                    )
+
+                    # Ensure mono channel and reshape
+                    waveform = waveform.reshape(1, -1)
+
+                    # Get embedding
+                    with torch.no_grad():
+                        # Ensure waveform is converted to PyTorch tensor
+                        waveform_tensor = torch.from_numpy(waveform).float()
+                        embedding = embedding_model.encode_batch(waveform_tensor)
+                        return embedding.squeeze().cpu().numpy()
+
+                except Exception as e:
+                    print(f"Error in segment embedding for segment {segment}: {e}")
+                    # Return a zero vector or handle the error appropriately
+                    return np.zeros(192)
+
+            # Get embeddings for each segment
+            embeddings = np.zeros(shape=(len(segments), 192))
+            for i, segment in enumerate(segments):
+                try:
+                    embeddings[i] = segment_embedding(segment, wav_path, rate, duration)
+                except Exception as e:
+                    print(f"Failed to get embedding for segment {i}: {e}")
+                    embeddings[i] = np.zeros(192)  # Fallback to zero vector
 
             embeddings = np.nan_to_num(embeddings)
+
+            # Cluster embeddings
             clustering = AgglomerativeClustering(num_speakers).fit(embeddings)
             labels = clustering.labels_
 
@@ -107,6 +145,20 @@ st.set_page_config(
 )
 
 st.title("🎙️ Speaker Diarization and Transcription")
+
+# Add CSS
+st.markdown("""
+    <style>
+    .stButton>button {
+        width: 100%;
+    }
+    .status-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 # Check for ffmpeg
 try:
@@ -171,3 +223,33 @@ if audio_file is not None:
 
             except Exception as e:
                 st.error(f"❌ Unexpected error: {str(e)}")
+
+# Help section
+with st.expander("ℹ️ Help & Tips"):
+    st.markdown("""
+    ### Prerequisites:
+    - FFmpeg must be installed on your system
+    - Sufficient disk space for temporary files
+
+    ### Tips for best results:
+    1. **Audio Quality**: Better quality audio will yield more accurate results
+    2. **Model Selection**:
+        - Use larger models for more accuracy (but slower processing)
+        - Use smaller models for faster results
+    3. **Language Selection**:
+        - Choose 'English' if your audio is in English
+        - Choose 'any' for other languages
+    4. **Number of Speakers**:
+        - Set this to the exact number of speakers in your audio
+        - Incorrect speaker counts may lead to less accurate diarization
+
+    ### Troubleshooting:
+    - If processing fails, try with a smaller model size
+    - Ensure your audio file isn't corrupted
+    - Check that FFmpeg is properly installed
+    - Make sure you have enough free disk space
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("Built with Streamlit, Whisper, and SpeechBrain")
